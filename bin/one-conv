@@ -991,10 +991,11 @@ def _cursor_cli_project_sessions(project: ProjectHandle) -> list[SessionHandle]:
 def _cursor_cli_rows(db: Path) -> list[bytes]:
     queries = ["mode=ro"]
     if not db.with_name(db.name + "-wal").exists():
-        queries.append("immutable=1")  # nothing pending in a WAL, so no row can be missed
+        queries.append("mode=ro&immutable=1")  # Never create a missing store during fallback.
     for query in queries:
         try:
-            conn = sqlite3.connect(f"file:{db}?{query}", uri=True)
+            # Escape path delimiters so URI options always enforce read-only access.
+            conn = sqlite3.connect(f"{db.resolve().as_uri()}?{query}", uri=True)
         except sqlite3.OperationalError:
             continue
         try:
@@ -1011,10 +1012,14 @@ def _cursor_cli_iso(stamp: str) -> str:
     m = _CURSOR_CLI_STAMP_RE.fullmatch(stamp.strip())
     if not m:
         return ""
-    offset = timedelta(hours=int(m.group(3) or 0), minutes=int(m.group(4) or 0))
-    if m.group(2) == "-":
-        offset = -offset
-    return datetime.strptime(m.group(1), "%b %d, %Y, %I:%M %p").replace(tzinfo=timezone(offset)).isoformat()
+    try:
+        offset = timedelta(hours=int(m.group(3) or 0), minutes=int(m.group(4) or 0))
+        if m.group(2) == "-":
+            offset = -offset
+        return datetime.strptime(m.group(1), "%b %d, %Y, %I:%M %p").replace(tzinfo=timezone(offset)).isoformat()
+    except (ValueError, OverflowError):
+        # Invalid stored dates must not prevent reading the conversation.
+        return ""
 
 
 def _cursor_cli_iter_turns(db: Path) -> list[Turn]:

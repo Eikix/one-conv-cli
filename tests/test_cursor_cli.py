@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import runpy
 import sqlite3
 import subprocess
 from pathlib import Path
@@ -169,3 +170,79 @@ def test_reading_a_thread_clears_its_local_unread_mark(cursor_cli_env: dict[str,
     _thread(cursor_cli_env)
     after = json.loads(_run(cursor_cli_env, "unread", "--source", "cursor-cli", "--json").stdout)
     assert ([h["uuid"] for h in before], after) == ([CHAT_ID], [])
+
+
+@pytest.fixture()
+def backend():
+    return runpy.run_path(str(CLI), run_name="cursor_cli_review")
+
+
+@pytest.mark.parametrize("name", ["cursor#home", "cursor?home", "cursor%23home", "cursor home"])
+def test_store_path_preserves_uri_characters(backend, tmp_path, name):
+    chat = tmp_path / name
+    _write_store(chat, [b'{}'])
+    assert backend["_cursor_cli_rows"](chat / "store.db") == [b'{}']
+
+
+def test_store_read_does_not_create_a_truncated_path(backend, tmp_path):
+    chat = tmp_path / "cursor#home"
+    _write_store(chat, [b'{}'])
+    backend["_cursor_cli_rows"](chat / "store.db")
+    assert not (tmp_path / "cursor").exists()
+
+
+def test_missing_store_is_not_created(backend, tmp_path):
+    db = tmp_path / "store.db"
+    backend["_cursor_cli_rows"](db)
+    assert not db.exists()
+
+
+def test_live_store_reads_committed_wal_rows(backend, tmp_path):
+    db = tmp_path / "store.db"
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute("PRAGMA journal_mode=wal")
+        conn.execute("CREATE TABLE blobs (data BLOB)")
+        conn.execute("INSERT INTO blobs VALUES (?)", (b'{}',))
+        conn.commit()
+        assert backend["_cursor_cli_rows"](db) == [b'{}']
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("stamp", [
+    "Tuesday, Sep 99, 2026, 2:49 PM (UTC+2)",
+    "Tuesday, Sep 15, 2026, 2:49 PM (UTC+24)",
+    "Tuesday, Sep 15, 2026, 2:49 PM (UTC+999999999999999999999)",
+])
+def test_invalid_timestamp_is_unknown(backend, stamp):
+    assert backend["_cursor_cli_iso"](stamp) == ""
+
+
+@pytest.mark.parametrize(("offset", "expected"), [
+    ("UTC", "+00:00"), ("UTC-3:30", "-03:30"), ("UTC+5:30", "+05:30"),
+])
+def test_timestamp_preserves_offset(backend, offset, expected):
+    assert backend["_cursor_cli_iso"](f"Tuesday, Sep 15, 2026, 2:49 PM ({offset})") == f"2026-09-15T14:49:00{expected}"
+
+
+def test_local_thread_reads_a_home_with_uri_characters(cursor_cli_env):
+    home = Path(cursor_cli_env["CURSOR_CLI_HOME"])
+    renamed = home.with_name("cursor#?%home")
+    home.rename(renamed)
+    cursor_cli_env["CURSOR_CLI_HOME"] = str(renamed)
+    payload = json.loads(_run(cursor_cli_env, "local", "thread", "one-conv-cursor-cli-fixture",
+                              "--source", "cursor-cli", "--json", "--no-mark-read").stdout)
+    assert [turn["text"] for turn in payload["turns"]] == ["please fix the widget", "Widget patched."]
+
+
+def test_local_thread_preserves_messages_with_an_invalid_timestamp(cursor_cli_env):
+    db = next(Path(cursor_cli_env["CURSOR_CLI_HOME"]).glob(f"chats/*/{CHAT_ID}/store.db"))
+    with sqlite3.connect(db) as conn:
+        conn.execute("UPDATE blobs SET data = replace(CAST(data AS TEXT), 'Sep 15', 'Sep 99') WHERE id = ?",
+                     (f"{3:064x}",))
+    payload = json.loads(_run(cursor_cli_env, "local", "thread", "one-conv-cursor-cli-fixture",
+                              "--source", "cursor-cli", "--json", "--no-mark-read").stdout)
+    assert [(turn["ts"], turn["text"]) for turn in payload["turns"]] == [
+        ("", "please fix the widget"), ("", "Widget patched."),
+    ]
